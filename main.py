@@ -18,8 +18,18 @@ def load_trained_model() -> tuple[SCMVLM, dict[int, str]]:
             "Run 'python train.py' first."
         )
 
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-    model = SCMVLM(num_classes=checkpoint["num_classes"]).to(DEVICE)
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
+    # checkpoints saved before the answer-head fix have no "question_aware" flag
+    question_aware = bool(checkpoint.get("question_aware", False))
+    model = SCMVLM(
+        num_classes=checkpoint["num_classes"], question_aware=question_aware
+    ).to(DEVICE)
+    if not question_aware:
+        print(
+            "WARNING: this checkpoint uses the old answer head, which never sees the "
+            "question, so its answers are the same for every question (mostly yes/no). "
+            "Retrain with 'python train.py' to get question-dependent answers."
+        )
     incompatible = model.load_state_dict(
         checkpoint["trainable_state_dict"], strict=False
     )
@@ -40,11 +50,19 @@ def load_trained_model() -> tuple[SCMVLM, dict[int, str]]:
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run SCM-VLM on any image + question")
+    parser.add_argument("--image", required=True, help="path to any image")
+    parser.add_argument("--question", required=True, help="question about the image")
+    args = parser.parse_args()
+    if not os.path.isfile(args.image):
+        parser.error(f"image not found: {args.image}")
 
     model, idx2answer = load_trained_model()
 
-    image_path = "images/Man_riding_bicycle.png"
-    question = "What is the person holding?"
+    image_path = args.image
+    question = args.question
 
     # =========================
     # VISION ENCODER OUTPUT
@@ -83,8 +101,10 @@ def main() -> None:
     print("\nAdjacency Matrix Shape:\n", adjacency.shape)
     print("\nAdjacency Matrix:\n", adjacency)
 
+    print("\nFor what-if questions use: python whatif_qa.py --image <path> --whatif \"What if ...\"")
+
     # =========================
-    # COUNTERFACTUAL REASONING
+    # COUNTERFACTUAL REASONING  (superseded by whatif_qa.py)
     # =========================
 
     # print("\n=========================")

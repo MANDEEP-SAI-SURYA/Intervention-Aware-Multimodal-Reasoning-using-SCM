@@ -1,7 +1,7 @@
 """Run question-guided scene-graph reasoning over an image.
 
 Usage:
-    python scene_graph_qa.py --image images/Man_riding_bicycle.png --question "What is the person riding?"
+    python scene_graph_qa.py --image <any image> --question "What is the person riding?"
     python scene_graph_qa.py --image image.jpg --question "Why is he using an umbrella?" --use-llm
 """
 
@@ -137,8 +137,8 @@ def llm_answer(question: str, evidence: str, model_name: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Question-guided scene graph QA")
-    parser.add_argument("--image", default="images/Man_riding_bicycle.png")
-    parser.add_argument("--question", default="What is the person riding?")
+    parser.add_argument("--image", required=True, help="path to any image")
+    parser.add_argument("--question", required=True)
     parser.add_argument("--use-llm", action="store_true", help="Generate the final answer through the configured LLM API.")
     parser.add_argument("--llm-model", default="openai/gpt-oss-120b")
     parser.add_argument("--graph-dir", default="results/scene_graphs")

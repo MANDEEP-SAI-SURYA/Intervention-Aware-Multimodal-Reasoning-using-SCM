@@ -93,6 +93,7 @@ class SCMGraph(nn.Module):
 
         return {
             "adjacency": adjacency,
+            "hard_adjacency": (adjacency > 0).float(),
             "probs": probs,
             "scores": scores
         }

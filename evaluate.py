@@ -4,22 +4,28 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import torch
 
-from configs.config import DEVICE
-from models.scm_vlm import SCMVLM
-from utils.visualization import visualize_graph
+import argparse
 
-DEMO_NUM_CLASSES = 3_129
+from main import load_trained_model
+from utils.visualization import visualize_graph
 
 
 def main() -> None:
 
-    model = SCMVLM(num_classes=DEMO_NUM_CLASSES).to(DEVICE)
+    parser = argparse.ArgumentParser(description="Causal-graph visualisation for any image + question")
+    parser.add_argument("--image", required=True, help="path to any image")
+    parser.add_argument("--question", required=True)
+    parser.add_argument("--out", default="images/causal_graph.png")
+    args = parser.parse_args()
+    if not os.path.isfile(args.image):
+        parser.error(f"image not found: {args.image}")
 
-    model.eval()
+    # uses the trained checkpoint (the old version used an untrained model)
+    model, idx2answer = load_trained_model()
 
-    image_path = "images/Man_riding_bicycle.png"
+    image_path = args.image
 
-    question = "Is the traffic light red?"
+    question = args.question
 
     with torch.no_grad():
 
@@ -31,7 +37,7 @@ def main() -> None:
     )
 
     print("\nPrediction:")
-    print(prediction.item())
+    print(idx2answer.get(prediction.item(), prediction.item()))
 
     # =========================
     # SAVE GRAPH IMAGE
@@ -39,13 +45,10 @@ def main() -> None:
 
     visualize_graph(
         output["adjacency"],
-        save_path="images/causal_graph.png"
+        save_path=args.out
     )
 
-    print(
-        "\nSaved graph visualization "
-        "to images/causal_graph.png"
-    )
+    print(f"\nSaved graph visualization to {args.out}")
 
     # =========================
     # PRINT TOP CAUSAL RELATIONS
@@ -78,8 +81,9 @@ def main() -> None:
                 continue
 
             print(
-                f"{labels[i]} ---> "
-                f"{labels[j]} : "
+                # A[i, j] > 0 means j -> i (j is a parent of i)
+                f"{labels[j]} ---> "
+                f"{labels[i]} : "
                 f"{adj[i][j].item():.3f}"
             )
 

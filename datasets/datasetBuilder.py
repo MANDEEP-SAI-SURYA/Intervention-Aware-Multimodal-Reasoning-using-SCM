@@ -23,7 +23,11 @@ class VQACOCO(Dataset):
         image_dir: str | Path,
         question_file: str | Path,
         annotation_file: str | Path,
+        max_answers: int | None = None,
     ) -> None:
+        """``max_answers``: keep only the N most frequent answers (3129 is the
+        standard VQA v2 vocabulary) and drop questions whose answer is outside
+        it.  ``None`` keeps every answer (the original behaviour)."""
         self.image_dir = Path(image_dir)
         question_path = Path(question_file)
         annotation_path = Path(annotation_file)
@@ -69,7 +73,13 @@ class VQACOCO(Dataset):
             )
 
         # A deterministic vocabulary keeps checkpoint class indices reproducible.
-        answers = sorted(answer_counts)
+        if max_answers is not None:
+            ranked = sorted(answer_counts.items(), key=lambda item: (-item[1], item[0]))
+            answers = sorted(answer for answer, _ in ranked[:max_answers])
+            keep = set(answers)
+            records = [record for record in records if record["answer"] in keep]
+        else:
+            answers = sorted(answer_counts)
         self.answer2idx = {answer: index for index, answer in enumerate(answers)}
         self.idx2answer = {index: answer for answer, index in self.answer2idx.items()}
         self.records = records

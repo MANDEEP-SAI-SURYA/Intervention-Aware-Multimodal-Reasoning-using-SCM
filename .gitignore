@@ -53,3 +53,6 @@ dist/
 # Coverage
 .coverage
 htmlcov/
+
+# Cached DETR/BERT features (train.py)
+cache/

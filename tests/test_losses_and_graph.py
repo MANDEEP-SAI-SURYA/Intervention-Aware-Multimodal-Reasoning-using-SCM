@@ -16,6 +16,7 @@ def test_acyclicity_loss_detects_cycle() -> None:
 
 
 def test_descendants_follow_directed_edges() -> None:
+    # chain 0 -> 1 -> 2 -> 3; A[i, j] > 0 means j -> i (messages = A @ h)
     adjacency = torch.tensor(
         [
             [0.0, 0.8, 0.0, 0.0],
@@ -23,8 +24,9 @@ def test_descendants_follow_directed_edges() -> None:
             [0.0, 0.0, 0.0, 0.7],
             [0.0, 0.0, 0.0, 0.0],
         ]
-    )
+    ).T
     assert find_descendants(adjacency, 0) == [1, 2, 3]
+    assert find_descendants(adjacency, 3) == []
 
 
 def test_intervention_cuts_incoming_edges() -> None:
@@ -36,7 +38,8 @@ def test_intervention_cuts_incoming_edges() -> None:
 
     new_objects, new_adjacency, descendants = engine.intervene(objects, adjacency, nodes, replacement)
 
-    assert torch.allclose(new_adjacency[0, :, 2], torch.zeros(4))
+    # A[i, j] > 0 means j -> i, so the parents of node 2 live in row 2
+    assert torch.allclose(new_adjacency[0, 2, :], torch.zeros(4))
     assert torch.allclose(new_objects[0, 2], replacement[0])
     assert len(descendants) == 1
 

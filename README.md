@@ -24,21 +24,57 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Place a test image at:
+## Train
 
-```text
-images/test.jpg
-```
-
-## Run
+DETR and BERT are frozen; their outputs are cached in `cache/` on the first epoch,
+so later epochs are much faster.
 
 ```bash
-python main.py
-python train.py
-python evaluate.py
+python train.py                               # 20k questions, 10 epochs, top-3129 answers
+python train.py --samples 3000 --epochs 20    # smaller run
+python train.py --no-cf                       # ablation: no counterfactual loss
 ```
 
-The first run downloads DETR and BERT weights from Hugging Face.
+Accuracies in `results/final_metrics.csv` and `results/training_history.csv` are
+measured on a held-out validation split (separate images), not on training data.
+
+> Checkpoints trained before the answer-head fix still load, but that head never
+> saw the question, so it answers every question the same way (mostly "yes"/"no").
+> Retrain to get question-dependent answers.
+
+## Run on any image
+
+```bash
+python main.py --image path/to/photo.jpg --question "What is the man holding?"
+python evaluate.py --image path/to/photo.jpg --question "Is the light red?"
+python scene_graph_qa.py --image path/to/photo.jpg --question "What is he riding?"
+```
+
+## What-if (counterfactual) questions with do()
+
+```bash
+python whatif_qa.py --image photo.jpg --whatif "What if the bicycle were a motorcycle? What is the man riding?"
+python whatif_qa.py --image photo.jpg --whatif "What if there were no umbrella, what is the person holding?"
+python whatif_qa.py --image photo.jpg --whatif "What if the traffic light turns green"
+python whatif_qa.py --image photo.jpg --whatif "What if there was a dog, is there a dog?"
+python whatif_qa.py --image photo.jpg --question "How many cars are there?" --do "remove:car"
+python whatif_qa.py --image photo.jpg --question "What is he riding?" --do "replace:#3->motorcycle"
+python whatif_qa.py --image photo.jpg --whatif "What if the cars were removed, is the road busy?" --use-llm
+```
+
+Supported interventions: **remove** an object, **replace** it with another COCO class,
+change an **attribute** (e.g. colour), or **add** an object. do(X_k = x') cuts the
+parents of node k, sets its value to x', keeps all other edges, and recomputes only the
+descendants of k. Answers are given for the real and the intervened scene, from the
+scene graph (counting, existence, colour, relations such as riding/holding/sitting on)
+and from the SCM-VLM classifier. A before/after causal-graph figure is saved to
+`results/whatif/`.
+
+## Tests
+
+```bash
+python -m pytest tests
+```
 
 ## Google Collab NoteBook
 https://colab.research.google.com/drive/1gc8_qWXL_sxYWe8thv1v4v5BfdpCYWNU?usp=sharing

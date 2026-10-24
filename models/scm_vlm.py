@@ -62,7 +62,8 @@ class QuestionAwareAnswerHead(nn.Module):
 class SCMVLM(nn.Module):
 
     def __init__(self, num_classes, num_layers: int = 2, freeze_backbones: bool = True,
-                 question_aware: bool = True):
+                 question_aware: bool = True, graph_mode: str = "soft", graph_top_k: int = 3,
+                 graph_geometry: bool = True):
         super().__init__()
 
         self.question_aware = question_aware
@@ -91,7 +92,11 @@ class SCMVLM(nn.Module):
         # -------------------------
         # GRAPH
         # -------------------------
-        self.graph = SCMGraph(HIDDEN_DIM, QUESTION_DIM)
+        if graph_mode == "soft":
+            self.graph = SCMGraph(HIDDEN_DIM, QUESTION_DIM, top_k=graph_top_k, threshold=0.0, mode="soft",
+                                  geometry=graph_geometry)
+        else:   # checkpoints trained before the collapse fix
+            self.graph = SCMGraph(HIDDEN_DIM, QUESTION_DIM, mode="legacy")
 
         # -------------------------
         # CAUSAL LAYERS
@@ -155,7 +160,9 @@ class SCMVLM(nn.Module):
         vision_output = self.vision(image_path)
         question_embedding = self.text(question)
 
-        output = self.forward_features(vision_output["embeddings"], question_embedding)
+        boxes = vision_output.get("boxes_norm")
+        boxes = torch.stack(boxes) if boxes else None
+        output = self.forward_features(vision_output["embeddings"], question_embedding, boxes)
         output.update({
             "labels": vision_output.get("labels"),
             "boxes": vision_output.get("boxes"),
@@ -163,10 +170,10 @@ class SCMVLM(nn.Module):
         })
         return output
 
-    def forward_features(self, raw_objects, question_embedding):
+    def forward_features(self, raw_objects, question_embedding, boxes=None):
         """Same as forward() but from pre-computed DETR object embeddings
         [B, N, OBJECT_DIM] and BERT question embeddings [B, QUESTION_DIM]
-        (used by the cached training loop)."""
+        (used by the cached training loop).  ``boxes``: [B, N, 4] scaled to 0-1."""
 
         if raw_objects.dim() == 2:
             raw_objects = raw_objects.unsqueeze(0)
@@ -175,7 +182,7 @@ class SCMVLM(nn.Module):
 
         objects = self.project_objects(raw_objects)
 
-        graph_output = self.graph(objects, question_embedding)
+        graph_output = self.graph(objects, question_embedding, boxes)
 
         adjacency = graph_output["adjacency"]
 
@@ -186,6 +193,7 @@ class SCMVLM(nn.Module):
         return {
             "logits": logits,
             "adjacency": adjacency,
+            "edge_probs": graph_output["probs"],
             "objects": objects,
             "question_embedding": question_embedding,
             "hidden": hidden,
@@ -237,10 +245,10 @@ class SCMVLM(nn.Module):
     # =====================================================
     # FROM OBJECTS ONLY
     # =====================================================
-    def forward_from_objects(self, objects, question):
+    def forward_from_objects(self, objects, question, boxes=None):
 
         question_embedding = self.text(question)
-        output = self.forward_features(objects, question_embedding)
+        output = self.forward_features(objects, question_embedding, boxes)
         return {
             "logits": output["logits"],
             "adjacency": output["adjacency"],

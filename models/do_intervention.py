@@ -204,8 +204,17 @@ class Intervention:
     new_label: str | None = None   # new class (replace/add) or attribute (attribute)
     nodes: list[int] | None = None  # optional explicit node indices
 
-    def describe(self) -> str:
+    def describe(self, mode: str = "do") -> str:
         target = self.target or "node " + ",".join(f"#{i}" for i in (self.nodes or []))
+        if mode == "recompute":
+            target = re.sub(r"^(?:the|a|an)\s+", "", target)
+            if self.kind == "remove":
+                return f"remove {target}"
+            if self.kind == "replace":
+                return f"replace {target} with {self.new_label}"
+            if self.kind == "attribute":
+                return f"make {target} {self.new_label}"
+            return f"add {self.new_label}"
         if self.kind == "remove":
             return f"do(remove {target})"
         if self.kind == "replace":
@@ -394,6 +403,8 @@ class World:
     question_embedding: torch.Tensor
     boxes: list | None = None
     scores: list | None = None
+    edge_probs: torch.Tensor | None = None   # [N, N] sigmoid edge scores before top-k/threshold
+    boxes_norm: torch.Tensor | None = None   # [N, 4] boxes scaled to 0-1 (for the relation graph)
 
 
 @dataclass
@@ -407,6 +418,7 @@ class CounterfactualResult:
     non_descendant_max_drift: float    # sanity check: should be ~0
     steering: dict = field(default_factory=dict)
     cf_index_map: dict = field(default_factory=dict)  # factual idx -> cf idx
+    mode: str = "do"                   # "do" (fixed graph) or "recompute" (graph re-estimated)
 
 
 def descendants_of(adjacency: torch.Tensor, nodes: list[int], eps: float = 1e-8) -> list[int]:
@@ -433,8 +445,21 @@ def _renormalise_rows(adjacency: torch.Tensor) -> torch.Tensor:
 # =====================================================================
 
 class DoInterventionReasoner:
+    MODES = ("recompute", "do")
+
     def __init__(self, model, idx2answer: dict[int, str] | None = None,
-                 steerer: ClassSteerer | None = None, attribute_strength: float = 0.5) -> None:
+                 steerer: ClassSteerer | None = None, attribute_strength: float = 0.5,
+                 mode: str = "recompute") -> None:
+        """mode:
+        * "recompute" - edit the scene (replace / remove / add / recolour an object), then let
+          the model re-calculate every relation between the objects and answer the question
+          with exactly the same pipeline as a normal question.
+        * "do"        - strict SCM intervention do(X_k = x'): the learned graph is kept, only
+          the parents of k are cut, and only the descendants of k are recomputed.
+        """
+        if mode not in self.MODES:
+            raise ValueError(f"mode must be one of {self.MODES}")
+        self.mode = mode
         self.model = model
         self.attribute_strength = attribute_strength
         self.idx2answer = idx2answer or {}
@@ -458,6 +483,29 @@ class DoInterventionReasoner:
         return [(self.answer_name(i), float(v)) for v, i in zip(values, indices)]
 
     # ---------------------------------------------------------------
+    def _normalise(self, adjacency: torch.Tensor) -> torch.Tensor:
+        graph = getattr(self.model, "graph", None)
+        if graph is not None and hasattr(graph, "normalise"):
+            return graph.normalise(adjacency)
+        return _renormalise_rows(adjacency)
+
+    @staticmethod
+    def _batch_boxes(boxes_norm):
+        return None if boxes_norm is None else boxes_norm.unsqueeze(0)
+
+    @staticmethod
+    def _cf_boxes_norm(world: "World", index_map: dict, n_cf: int):
+        """Boxes of the edited scene: kept objects keep their box; an added object has no
+        detected position, so it is placed in the middle of the image with the median
+        object size."""
+        if world.boxes_norm is None:
+            return None
+        inverse = {c: f for f, c in index_map.items()}
+        sizes = (world.boxes_norm[:, 2:] - world.boxes_norm[:, :2]).median(dim=0).values
+        centre = torch.tensor([0.5, 0.5], dtype=world.boxes_norm.dtype, device=world.boxes_norm.device)
+        default = torch.cat([centre - sizes / 2, centre + sizes / 2])
+        return torch.stack([world.boxes_norm[inverse[c]] if c in inverse else default for c in range(n_cf)])
+
     def _decode(self, hidden: torch.Tensor, question_embedding: torch.Tensor) -> torch.Tensor:
         return self.model.decode(hidden.unsqueeze(0), question_embedding)[0]
 
@@ -472,22 +520,27 @@ class DoInterventionReasoner:
         raw = vision["embeddings"]
         if raw.dim() == 3:
             raw = raw[0]
-        world = self.observe_from_tensors(raw, vision["labels"][0], question)
+        boxes_norm = vision["boxes_norm"][0] if vision.get("boxes_norm") else None
+        world = self.observe_from_tensors(raw, vision["labels"][0], question, boxes_norm)
         world.boxes = vision["boxes"][0].detach().cpu().tolist() if vision.get("boxes") else None
         world.scores = vision["scores"][0].detach().cpu().tolist() if vision.get("scores") else None
         return world
 
     @torch.no_grad()
-    def observe_from_tensors(self, raw_objects: torch.Tensor, labels: list[str], question: str) -> World:
+    def observe_from_tensors(self, raw_objects: torch.Tensor, labels: list[str], question: str,
+                             boxes_norm: torch.Tensor | None = None) -> World:
         if raw_objects.shape[0] == 0:
             raise RuntimeError("The detector found no objects, so there is no causal graph to intervene on.")
         q = self.model.text(question)
         objects = self.model.project_objects(raw_objects.unsqueeze(0))
-        adjacency = self.model.graph(objects, q)["adjacency"]
+        if boxes_norm is None and getattr(self.model.graph, "geometry", False):
+            raise RuntimeError("This model's relation graph needs object boxes.")
+        graph = self.model.graph(objects, q, self._batch_boxes(boxes_norm))
+        adjacency = graph["adjacency"]
         hidden, _ = self.model.run_causal_layers(objects, adjacency)
         logits = self.model.decode(hidden, q)
         return World(list(labels), raw_objects, objects[0], adjacency[0], hidden[0], logits[0],
-                     question, q)
+                     question, q, edge_probs=graph["probs"][0], boxes_norm=boxes_norm)
 
     # ---------------------------------------------------------------
     def _target_nodes(self, world: World, intervention: Intervention) -> list[int]:
@@ -530,7 +583,10 @@ class DoInterventionReasoner:
 
     def _finish(self, world, intervention, cf_objects, cf_adj, cf_labels, cf_raw,
                 intervened, affected_cf, index_map, descendants, steering) -> CounterfactualResult:
-        """Recompute only affected nodes; copy factual values for the rest."""
+        if self.mode == "recompute":
+            return self._finish_recompute(world, intervention, cf_objects, cf_labels, cf_raw,
+                                          intervened, index_map, steering)
+        # do-mode: recompute only affected nodes; copy factual values for the rest.
         full = self._propagate(cf_objects, cf_adj)
         cf_hidden = full.clone()
         drift = 0.0
@@ -551,6 +607,138 @@ class DoInterventionReasoner:
         return CounterfactualResult(intervention, world, cf_world, intervened, descendants,
                                     sorted(unaffected), drift, steering, index_map)
 
+    def _finish_recompute(self, world, intervention, cf_objects, cf_labels, cf_raw,
+                          intervened, index_map, steering) -> CounterfactualResult:
+        """Scene-edit mode: the model re-calculates all relations on the edited scene and
+        answers exactly like a normal question:  A' = f_theta(O', q),  h' = SCM layers(O', A'),
+        Y' = Decoder(h', q)."""
+        q = world.question_embedding
+        cf_boxes_norm = self._cf_boxes_norm(world, index_map, len(cf_labels))
+        graph = self.model.graph(cf_objects.unsqueeze(0), q, self._batch_boxes(cf_boxes_norm))
+        cf_adj = graph["adjacency"][0]
+        cf_probs = graph["probs"][0]
+        cf_hidden = self._propagate(cf_objects, cf_adj)
+        cf_logits = self._decode(cf_hidden, q)
+
+        changed, unaffected = [], []
+        for f_idx, c_idx in index_map.items():
+            if f_idx in intervened:
+                continue
+            before = world.hidden[f_idx]
+            delta = float((cf_hidden[c_idx] - before).norm() / before.norm().clamp(min=1e-8))
+            (changed if delta > 1e-4 else unaffected).append(f_idx)
+
+        inverse = {c: f for f, c in index_map.items()}
+        cf_boxes = None
+        if world.boxes is not None:
+            cf_boxes = [world.boxes[inverse[c]] if c in inverse else None for c in range(len(cf_labels))]
+        cf_world = World(cf_labels, cf_raw, cf_objects, cf_adj, cf_hidden, cf_logits,
+                         world.question, q, boxes=cf_boxes, edge_probs=cf_probs, boxes_norm=cf_boxes_norm)
+        return CounterfactualResult(intervention, world, cf_world, intervened, sorted(changed),
+                                    sorted(unaffected), 0.0, steering, index_map, mode="recompute")
+
+    # ---------------------------------------------------------------
+    @staticmethod
+    def relationship_changes(result: CounterfactualResult, min_change: float = 0.05,
+                             top_scores: int = 3) -> dict:
+        """How the relations between objects differ between the real and the edited scene.
+
+        Nodes keep their real-scene ids so both graphs can be compared; an added object is
+        called "new".  An edge "a -> b" means a influences b (A[b, a] > 0)."""
+        factual, cf = result.factual, result.counterfactual
+        inverse = {c: f for f, c in result.cf_index_map.items()}
+        n_f, n_c = len(factual.labels), len(cf.labels)
+
+        def f_name(f):
+            return f"{factual.labels[f]}({f})"
+
+        def c_name(c):
+            f = inverse.get(c)
+            return f"{cf.labels[c]}({f})" if f is not None else f"{cf.labels[c]}(new)"
+
+        def key_of_c(c):
+            f = inverse.get(c)
+            return ("f", f) if f is not None else ("n", c)
+
+        before = {}
+        for i in range(n_f):
+            for j in range(n_f):
+                if i != j and factual.adjacency[i, j] > 1e-6:
+                    before[(("f", j), ("f", i))] = (float(factual.adjacency[i, j]), f"{f_name(j)} -> {f_name(i)}")
+        after = {}
+        for i in range(n_c):
+            for j in range(n_c):
+                if i != j and cf.adjacency[i, j] > 1e-6:
+                    after[(key_of_c(j), key_of_c(i))] = (float(cf.adjacency[i, j]), f"{c_name(j)} -> {c_name(i)}")
+
+        removed_ids = {("f", f) for f in result.intervened_nodes
+                       if result.intervention.kind == "remove"}
+        new_edges = [{"edge": text, "weight": w} for k, (w, text) in after.items() if k not in before]
+        intervened_ids = {("f", f) for f in result.intervened_nodes}
+
+        def lost_reason(k):
+            if k[0] in removed_ids or k[1] in removed_ids:
+                return "object removed"
+            if result.mode == "do" and k[1] in intervened_ids:
+                return "cut by do()"
+            return "relation re-estimated"
+
+        lost_edges = [{"edge": text, "weight": w, "reason": lost_reason(k)}
+                      for k, (w, text) in before.items() if k not in after]
+        changed_edges = []
+        for k in before.keys() & after.keys():
+            w0, text0 = before[k]
+            w1, text1 = after[k]
+            if abs(w1 - w0) >= min_change:
+                changed_edges.append({"edge": text1, "before": w0, "after": w1})
+        unchanged = sum(1 for k in before.keys() & after.keys()
+                        if abs(after[k][0] - before[k][0]) < min_change)
+
+        # links of the changed object(s), before and after (thresholded graph + raw edge scores)
+        focus = []
+        for node in result.intervened_nodes:
+            entry = {}
+            if node < n_f:
+                entry["before_name"] = f_name(node)
+                entry["before_parents"] = [(f_name(j), float(factual.adjacency[node, j]))
+                                           for j in range(n_f) if j != node and factual.adjacency[node, j] > 1e-6]
+                entry["before_children"] = [(f_name(i), float(factual.adjacency[i, node]))
+                                            for i in range(n_f) if i != node and factual.adjacency[i, node] > 1e-6]
+                if factual.edge_probs is not None:
+                    scores = [(f_name(j), float(factual.edge_probs[node, j])) for j in range(n_f) if j != node]
+                    entry["before_top_scores"] = sorted(scores, key=lambda x: -x[1])[:top_scores]
+            c = result.cf_index_map.get(node, node if node >= n_f else None)
+            if c is not None and c < n_c:
+                entry["after_name"] = c_name(c)
+                entry["after_parents"] = [(c_name(j), float(cf.adjacency[c, j]))
+                                          for j in range(n_c) if j != c and cf.adjacency[c, j] > 1e-6]
+                entry["after_children"] = [(c_name(i), float(cf.adjacency[i, c]))
+                                           for i in range(n_c) if i != c and cf.adjacency[i, c] > 1e-6]
+                if cf.edge_probs is not None:
+                    scores = [(c_name(j), float(cf.edge_probs[c, j])) for j in range(n_c) if j != c]
+                    entry["after_top_scores"] = sorted(scores, key=lambda x: -x[1])[:top_scores]
+            focus.append(entry)
+
+        # objects whose internal state changed most
+        state_changes = []
+        for f, c in result.cf_index_map.items():
+            if f in result.intervened_nodes:
+                continue
+            delta = float((cf.hidden[c] - factual.hidden[f]).norm() / factual.hidden[f].norm().clamp(min=1e-8))
+            if delta > 1e-4:
+                state_changes.append({"node": f_name(f), "relative_change": delta})
+        state_changes.sort(key=lambda x: -x["relative_change"])
+
+        return {
+            "mode": result.mode,
+            "new": sorted(new_edges, key=lambda x: -x["weight"]),
+            "lost": sorted(lost_edges, key=lambda x: -x["weight"]),
+            "changed": sorted(changed_edges, key=lambda x: -abs(x["after"] - x["before"])),
+            "unchanged": unchanged,
+            "focus": focus,
+            "state_changes": state_changes,
+        }
+
     def _remove(self, world: World, intervention: Intervention) -> CounterfactualResult:
         removed = self._target_nodes(world, intervention)
         keep = [i for i in range(len(world.labels)) if i not in removed]
@@ -560,7 +748,7 @@ class DoInterventionReasoner:
         index_map = {f: c for c, f in enumerate(keep)}
         keep_t = torch.tensor(keep, device=world.adjacency.device)
         cf_adj = world.adjacency.index_select(0, keep_t).index_select(1, keep_t)
-        cf_adj = _renormalise_rows(cf_adj)
+        cf_adj = self._normalise(cf_adj)
         affected_cf = {index_map[d] for d in descendants}
         return self._finish(world, intervention, world.objects[keep_t], cf_adj,
                             [world.labels[i] for i in keep], world.raw_objects[keep_t],
@@ -648,11 +836,13 @@ class DoInterventionReasoner:
         )
         # Learned edge function decides whom the new object influences (its column);
         # its own row stays empty because do() makes it exogenous.
-        scored = self.model.graph(cf_objects.unsqueeze(0), world.question_embedding)["adjacency"][0]
+        index_map_add = {i: i for i in range(n)}
+        scored = self.model.graph(cf_objects.unsqueeze(0), world.question_embedding,
+                                  self._batch_boxes(self._cf_boxes_norm(world, index_map_add, n + 1)))["adjacency"][0]
         cf_adj = torch.zeros(n + 1, n + 1, dtype=world.adjacency.dtype, device=world.adjacency.device)
         cf_adj[:n, :n] = world.adjacency
         cf_adj[:n, n] = scored[:n, n]
-        cf_adj = _renormalise_rows(cf_adj)
+        cf_adj = self._normalise(cf_adj)
         cf_adj[n, :] = 0.0
         descendants_cf = descendants_of(cf_adj, [n])
         descendants = [d for d in descendants_cf if d < n]
@@ -733,7 +923,7 @@ class DoInterventionReasoner:
 
         # edges cut by do(): parents of the intervened nodes
         cut = []
-        if kind in {"replace", "attribute", "remove"}:
+        if kind in {"replace", "attribute", "remove"} and result.mode == "do":
             for i in nodes:
                 for j in range(len(factual.labels)):
                     if j != i and factual.adjacency[i, j] > 1e-6 and j not in nodes:
@@ -759,7 +949,17 @@ class DoInterventionReasoner:
         plural = len(nodes) > 1
         target = _plural(base, len(nodes))
         verb, self_word = ("depend", "themselves") if plural else ("depends", "itself")
-        if effects:
+        if result.mode == "recompute":
+            if effects:
+                causes = ", ".join(f"{e['label']} (node {e['node']}, changes {100 * e['relative_change']:.0f}%)"
+                                   for e in effects)
+                conclusion = (f"After the model re-calculates the relations in the edited scene, the "
+                              f"objects whose state changes are: {causes}.")
+            else:
+                conclusion = ("After the model re-calculates the relations in the edited scene, no other "
+                              f"object's state changes; only the {target} {self_word} "
+                              f"{'change' if plural else 'changes'}.")
+        elif effects:
             causes = ", ".join(
                 f"{e['label']} (node {e['node']}, {'direct' if e['direct'] else 'indirect'}, "
                 f"changes {100 * e['relative_change']:.0f}%)" for e in effects
@@ -787,7 +987,7 @@ class DoInterventionReasoner:
         f_idx = int(f_probs.argmax())
         c_idx = int(c_probs.argmax())
         return {
-            "intervention": result.intervention.describe(),
+            "intervention": result.intervention.describe(result.mode),
             "factual_answer": self.answer_name(f_idx),
             "factual_confidence": float(f_probs[f_idx]),
             "counterfactual_answer": self.answer_name(c_idx),

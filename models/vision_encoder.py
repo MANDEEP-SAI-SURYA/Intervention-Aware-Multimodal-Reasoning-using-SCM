@@ -170,10 +170,18 @@ class VisionEncoder(nn.Module):
             filtered_embeddings
         )
 
+        # boxes scaled to 0-1 by the image size (used by the relation graph)
+        boxes_norm = [
+            box / torch.tensor([image.size[0], image.size[1], image.size[0], image.size[1]],
+                               dtype=box.dtype, device=box.device)
+            for box, image in zip(boxes, images)
+        ]
+
         return {
             "embeddings": filtered_embeddings,
             "labels": labels,
             "boxes": boxes,
+            "boxes_norm": boxes_norm,
             "scores": scores
         }
 

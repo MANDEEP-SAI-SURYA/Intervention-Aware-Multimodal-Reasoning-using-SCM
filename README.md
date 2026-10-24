@@ -38,6 +38,17 @@ python train.py --no-cf                       # ablation: no counterfactual loss
 Accuracies in `results/final_metrics.csv` and `results/training_history.csv` are
 measured on a held-out validation split (separate images), not on training data.
 
+**Relation graph.** Each object attends over its 3 most likely parents (soft edges, no hard
+threshold, so the graph cannot collapse to empty). The edge scorer combines appearance
+(DETR features + question) with a separate box-geometry branch (relative position, gaps,
+overlap, size ratio), and edges are weakly supervised: objects whose boxes touch should be
+linked. Each epoch logs the parent weight per object and, on validation images, the edge
+probability for touching vs. distant objects. Ablation: `--no-edge-supervision`;
+original graph: `--graph-mode legacy`.
+
+> Checkpoints from before this change load with the old graph (hard 0.5 threshold), which
+> ended with no edges at all. Retrain to get working relations.
+
 > Checkpoints trained before the answer-head fix still load, but that head never
 > saw the question, so it answers every question the same way (mostly "yes"/"no").
 > Retrain to get question-dependent answers.
@@ -62,10 +73,22 @@ python whatif_qa.py --image photo.jpg --question "What is he riding?" --do "repl
 python whatif_qa.py --image photo.jpg --whatif "What if the cars were removed, is the road busy?" --use-llm
 ```
 
+Two modes:
+
+* `--mode recompute` (default) - edit the scene, then the model **re-calculates all relations**
+  between the objects and answers the question with exactly the same pipeline as a normal
+  question. The output lists new, lost and changed relations and the changed object's links
+  before and after.
+* `--mode do` - strict SCM intervention do(X_k = x'): the learned graph is kept, only the edges
+  into the changed object are cut, and only its descendants are recomputed.
+
+```bash
+python whatif_qa.py --image photo.jpg --whatif "What if the bicycle were a motorcycle? What is the man riding?"
+python whatif_qa.py --image photo.jpg --mode do --whatif "What if the bicycle were a motorcycle? What is the man riding?"
+```
+
 Supported interventions: **remove** an object, **replace** it with another COCO class,
-change an **attribute** (e.g. colour), or **add** an object. do(X_k = x') cuts the
-parents of node k, sets its value to x', keeps all other edges, and recomputes only the
-descendants of k. Answers are given for the real and the intervened scene, from the
+change an **attribute** (e.g. colour), or **add** an object. Answers are given for the real and the intervened scene, from the
 scene graph (counting, existence, colour, relations such as riding/holding/sitting on)
 and from the SCM-VLM classifier. A before/after causal-graph figure is saved to
 `results/whatif/`.

@@ -21,9 +21,19 @@ def load_trained_model() -> tuple[SCMVLM, dict[int, str]]:
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
     # checkpoints saved before the answer-head fix have no "question_aware" flag
     question_aware = bool(checkpoint.get("question_aware", False))
+    # checkpoints saved before the graph-collapse fix have no "graph_mode"
+    graph_mode = checkpoint.get("graph_mode", "legacy")
     model = SCMVLM(
-        num_classes=checkpoint["num_classes"], question_aware=question_aware
+        num_classes=checkpoint["num_classes"], question_aware=question_aware,
+        graph_mode=graph_mode, graph_top_k=checkpoint.get("graph_top_k", 3),
+        graph_geometry=bool(checkpoint.get("graph_geometry", False)),
     ).to(DEVICE)
+    if graph_mode == "legacy":
+        print(
+            "NOTE: this checkpoint uses the old graph (hard 0.5 edge threshold). In models trained "
+            "this way the relation graph usually collapsed to no edges. Retrain with "
+            "'python train.py' to get the soft graph."
+        )
     if not question_aware:
         print(
             "WARNING: this checkpoint uses the old answer head, which never sees the "

@@ -111,11 +111,16 @@ def save_comparison(result: CounterfactualResult, path: Path) -> None:
 
     figure, axes = plt.subplots(1, 2, figsize=(14, 7))
     _draw(axes[0], factual.adjacency.cpu(), [f"{i}:{name}" for i, name in enumerate(factual.labels)], f_colours,
-          "Factual causal graph", {i: layout[i] for i in range(n_f)})
+          "Real scene (learned relations)", {i: layout[i] for i in range(n_f)})
     _draw(axes[1], cf.adjacency.cpu(), c_names, c_colours,
-          f"After {result.intervention.describe()}", c_positions)
-    figure.suptitle("red = intervened node(s)   orange = descendants (recomputed)   "
-                    "blue = unaffected (factual value kept)", fontsize=9)
+          f"After {result.intervention.describe(result.mode)}"
+          + ("  (relations re-computed)" if result.mode == "recompute" else ""), c_positions)
+    if result.mode == "recompute":
+        figure.suptitle("red = changed object   orange = objects whose state changed   "
+                        "blue = unchanged", fontsize=9)
+    else:
+        figure.suptitle("red = intervened node(s)   orange = descendants (recomputed)   "
+                        "blue = unaffected (factual value kept)", fontsize=9)
     path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(path, bbox_inches="tight", dpi=160)
     plt.close(figure)
@@ -167,21 +172,67 @@ def llm_whatif_answer(whatif_text: str, summary: dict, factual_labels, cf_labels
         f"SCM-VLM counterfactual answer: {summary['counterfactual_answer']} "
         f"({summary['counterfactual_confidence']:.2f})\n"
         f"{scene_lines}"
+        f"{summary.get('relationship_lines', '')}"
         "Reason about the counterfactual scene, not the real one."
     )
     return llm_answer(whatif_text, evidence, model_name)
 
 
-def print_classifier(summary: dict, legacy: bool) -> None:
-    print("\nSCM-VLM classifier" + (" (old checkpoint: answer head ignores the question - retrain)"
-                                   if legacy else "") + ":")
+def _links(items) -> str:
+    return ", ".join(f"{name} {weight:.2f}" for name, weight in items) or "-"
+
+
+def print_relationships(rel: dict, limit: int = 8) -> None:
+    print("\n=========================")
+    print("RELATIONSHIPS: REAL SCENE -> EDITED SCENE")
+    print("=========================")
+    print("(a -> b means a influences b; numbers are edge weights)")
+    for entry in rel["focus"]:
+        name_before = entry.get("before_name")
+        name_after = entry.get("after_name")
+        title = f"{name_before} -> {name_after}" if name_before and name_after else (name_before or name_after)
+        status = "" if name_after else "  (removed)"
+        if not name_before:
+            status = "  (added)"
+        print(f"\nObject {title}{status}")
+        if name_before:
+            print(f"  before: influenced by: {_links(entry['before_parents'])}")
+            print(f"          influences   : {_links(entry['before_children'])}")
+        if name_after:
+            print(f"  after : influenced by: {_links(entry['after_parents'])}")
+            print(f"          influences   : {_links(entry['after_children'])}")
+        if entry.get("before_top_scores") or entry.get("after_top_scores"):
+            print(f"  strongest edge scores (before threshold): "
+                  f"before [{_links(entry.get('before_top_scores', []))}]  "
+                  f"after [{_links(entry.get('after_top_scores', []))}]")
+
+    print(f"\nNew relations     : {len(rel['new'])}")
+    for item in rel["new"][:limit]:
+        print(f"  + {item['edge']}  ({item['weight']:.2f})")
+    print(f"Lost relations    : {len(rel['lost'])}")
+    for item in rel["lost"][:limit]:
+        print(f"  - {item['edge']}  ({item['weight']:.2f}, {item['reason']})")
+    print(f"Changed strength  : {len(rel['changed'])}")
+    for item in rel["changed"][:limit]:
+        print(f"  ~ {item['edge']}  {item['before']:.2f} -> {item['after']:.2f}")
+    print(f"Unchanged         : {rel['unchanged']}")
+    if rel["state_changes"]:
+        top = ", ".join(f"{x['node']} {100 * x['relative_change']:.0f}%" for x in rel["state_changes"][:limit])
+        print(f"Objects whose state changed most: {top}")
+
+
+def print_classifier(summary: dict, legacy: bool, mode: str = "recompute") -> None:
+    how = ("same pipeline as a normal question, on the edited scene" if mode == "recompute"
+           else "strict do(): fixed graph, only descendants recomputed")
+    print(f"SCM-VLM answer ({how})"
+          + (" - old checkpoint: answer head ignores the question, retrain" if legacy else "") + ":")
     print(f"  real scene      : {summary['factual_answer']} ({summary['factual_confidence']:.3f})")
-    print(f"  intervened scene: {summary['counterfactual_answer']} ({summary['counterfactual_confidence']:.3f})")
+    print(f"  edited scene    : {summary['counterfactual_answer']} ({summary['counterfactual_confidence']:.3f})")
     print(f"  answer changed  : {'YES' if summary['answer_changed'] else 'no'}   "
           f"effect on P(real answer) {summary['effect_on_factual_answer']:+.4f}   "
           f"total variation {summary['total_variation']:.4f}")
     print("  top real        :", ", ".join(f"{a} {p:.3f}" for a, p in summary["factual_top"]))
-    print("  top intervened  :", ", ".join(f"{a} {p:.3f}" for a, p in summary["counterfactual_top"]))
+    print("  top edited      :", ", ".join(f"{a} {p:.3f}" for a, p in summary["counterfactual_top"]))
 
 
 # =====================================================================
@@ -203,6 +254,11 @@ def main() -> None:
     parser.add_argument("--do", dest="do_spec",
                         help="explicit intervention: remove:car | replace:umbrella->bicycle | "
                              "attribute:traffic light->green | add:dog | remove:#3")
+    parser.add_argument("--mode", choices=["recompute", "do"], default="recompute",
+                        help="recompute (default): edit the scene, let the model re-calculate all "
+                             "relations and answer like a normal question.  do: strict SCM do() - "
+                             "keep the learned graph, cut the parents of the changed object, "
+                             "recompute only its descendants.")
     parser.add_argument("--strength", type=float, default=0.5,
                         help="size of an attribute intervention relative to the node norm (default 0.5)")
     parser.add_argument("--use-llm", action="store_true", help="also phrase the answer with the Groq LLM")
@@ -229,6 +285,7 @@ def main() -> None:
 
     reasoner = build_reasoner()
     reasoner.attribute_strength = args.strength
+    reasoner.mode = args.mode
     try:
         world = reasoner.observe(args.image, question or NEUTRAL_QUESTION)
     except RuntimeError as error:
@@ -246,7 +303,7 @@ def main() -> None:
     try:
         result = reasoner.intervene(world, intervention)
     except (ValueError, IndexError) as error:
-        print(f"\nCannot apply {intervention.describe()}: {error}")
+        print(f"\nCannot apply {intervention.describe(args.mode)}: {error}")
         return
     summary = reasoner.summarise(result)
     effect = reasoner.effect_report(result)
@@ -258,9 +315,12 @@ def main() -> None:
     print(f"Question          : {question or '(none - reporting the effect of the intervention)'}")
     print(f"Intervention      : {summary['intervention']}")
     print(f"Intervened nodes  : {', '.join(summary['intervened_nodes'])}")
-    print(f"Descendants       : {', '.join(summary['descendants']) or 'none (no downstream effect)'}")
-    print(f"Unaffected nodes  : {summary['unaffected_nodes']} (factual values kept, drift="
-          f"{summary['non_descendant_max_drift']:.2e})")
+    print(f"Mode              : {args.mode}" + (" (relations re-calculated on the edited scene)"
+                                                   if args.mode == "recompute" else " (strict SCM do())"))
+    if args.mode == "do":
+        print(f"Descendants       : {', '.join(summary['descendants']) or 'none (no downstream effect)'}")
+        print(f"Unaffected nodes  : {summary['unaffected_nodes']} (factual values kept, drift="
+              f"{summary['non_descendant_max_drift']:.2e})")
     for node, info in summary["steering"].items():
         if info.get("attribute"):
             print(f"x' for node {node}  : '{info['label']}' (text-guided; similarity to the description "
@@ -280,6 +340,14 @@ def main() -> None:
         print(f"Causal edges cut  : {'; '.join(effect['edges_cut'])}")
     print(f"Consequence       : {effect['conclusion']}")
 
+    # ---------------- how the relations between objects changed ------------------
+    relations = reasoner.relationship_changes(result)
+    summary["relationships"] = relations
+    summary["relationship_lines"] = (
+        "Relations added after the edit: " + ("; ".join(x["edge"] for x in relations["new"][:8]) or "none") + "\n"
+        + "Relations lost after the edit: " + ("; ".join(x["edge"] for x in relations["lost"][:8]) or "none") + "\n")
+    print_relationships(relations)
+
     # ---------------- answer to the follow-up question (real vs. intervened) ------
     scene_factual = scene_cf = None
     if effect_only:
@@ -296,18 +364,18 @@ def main() -> None:
         scene_cf = answer_from_scene(question, reasoner.scene_objects(world, result), resolve)
 
         print("\n=========================")
-        print("ANSWER")
+        print(f"ANSWER: {question}")
         print("=========================")
+        print_classifier(summary, not getattr(reasoner.model, "question_aware", True), args.mode)
+        print("\nScene-graph check (read from the detected objects and boxes):")
         if scene_cf is not None:
-            print(f"Real scene        : {scene_factual.answer:<14} ({scene_factual.reason})")
-            print(f"Intervened scene  : {scene_cf.answer:<14} ({scene_cf.reason})")
-            print("Answer changed    :", "YES" if scene_factual.answer != scene_cf.answer else "no")
+            print(f"  real scene      : {scene_factual.answer:<14} ({scene_factual.reason})")
+            print(f"  edited scene    : {scene_cf.answer:<14} ({scene_cf.reason})")
+            print("  answer changed  :", "YES" if scene_factual.answer != scene_cf.answer else "no")
         else:
-            print("The scene graph cannot answer this question type (supported: how many / is there / "
-                  "what color / what is the X riding|holding|on|near ...).")
-            print("Showing the SCM-VLM classifier answer below" + (" - add --use-llm for a free-form answer."
-                                                                  if not args.use_llm else "."))
-        print_classifier(summary, not getattr(reasoner.model, "question_aware", True))
+            print("  not available for this question type (supported: how many / is there / what color / "
+                  "what is the X riding|holding|on|near ...)" + ("" if args.use_llm else
+                                                               "; add --use-llm for a free-form answer"))
     summary["scene_graph_factual"] = vars(scene_factual) if scene_factual else None
     summary["scene_graph_counterfactual"] = vars(scene_cf) if scene_cf else None
 

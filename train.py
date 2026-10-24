@@ -17,6 +17,11 @@ What changed compared with the first version
 * The acyclicity term is the NOTEARS constraint tr(e^{A o A}) - n from the paper.
 * do() interventions cut the parents of the intervened node (row k), and the
   graph is no longer rebuilt after the cut (models/scm_vlm.py).
+* Relation graph (second Colab run had NO edges left): edges are soft top-k
+  attention over parents (no 0.5 threshold, so the graph cannot vanish), the
+  edge scorer sees each pair's box geometry, and edges are weakly supervised:
+  objects whose boxes touch should be linked (LAMBDA_EDGE).  The log reports
+  the edge probability for touching vs. distant objects on validation images.
 """
 
 import os
@@ -30,6 +35,7 @@ from pathlib import Path
 
 import pandas as pd
 import torch
+from PIL import Image
 import torch.nn.functional as F
 
 torch.backends.cudnn.benchmark = True
@@ -64,11 +70,18 @@ SEED = 42
 TOP_K = 3
 RANDOM_NODE_PROB = 0.3
 
-LAMBDA_CF = 0.5
-LAMBDA_SPARSE = 0.1
-LAMBDA_ACYCLIC = 0.2
-LAMBDA_SHIFT = 0.3
+# Graph-collapse fix: the first Colab model ended with NO edges (all edge scores < 0.5).
+# The hard 0.5 threshold gave edges below it no gradient, and sparsity + acyclicity +
+# the "predictions must not change" counterfactual terms pushed every score down.
+# The soft graph (models/scm_graph.py) removes the threshold; these weights are gentler.
+LAMBDA_CF = 0.1          # KL(cf || factual): invariance to small perturbations (no CF labels yet)
+LAMBDA_SPARSE = 0.01
+LAMBDA_ACYCLIC = 0.05
+LAMBDA_SHIFT = 0.0       # penalised ANY change under intervention -> disabled
 LAMBDA_ENTROPY = 0.05
+LAMBDA_EDGE = 0.5        # weak relation supervision: objects whose boxes touch should be linked
+CONTACT_GAP = 0.02       # boxes closer than 2% of the image size count as touching
+GRAPH_TOP_K = 3
 
 
 # =====================================================
@@ -87,14 +100,22 @@ class FeatureCache:
         self.questions: dict[str, torch.Tensor] = {}
 
     @torch.no_grad()
-    def image(self, image_path: str) -> torch.Tensor:
+    def image(self, image_path: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """DETR object embeddings [N, 256] and boxes [N, 4] (x0, y0, x1, y1 scaled to 0-1).
+        Cache files from the earlier version have no boxes and are recomputed once."""
         path = self.image_dir / f"{_key(os.path.abspath(image_path))}.pt"
         if path.is_file():
-            return torch.load(path, map_location="cpu", weights_only=False)["embeddings"]
+            item = torch.load(path, map_location="cpu", weights_only=False)
+            if "boxes" in item:
+                return item["embeddings"], item["boxes"]
         output = self.model.vision(image_path)
         embeddings = output["embeddings"][0].detach().cpu()
-        torch.save({"embeddings": embeddings, "labels": output["labels"][0]}, path)
-        return embeddings
+        boxes = output["boxes"][0].detach().cpu().float() if output.get("boxes") else torch.zeros(len(embeddings), 4)
+        with Image.open(image_path) as image:
+            width, height = image.size
+        boxes = boxes / torch.tensor([width, height, width, height], dtype=torch.float)
+        torch.save({"embeddings": embeddings, "labels": output["labels"][0], "boxes": boxes}, path)
+        return embeddings, boxes
 
     @torch.no_grad()
     def question(self, question: str) -> torch.Tensor:
@@ -140,6 +161,9 @@ def save_checkpoint(model, dataset, epoch, train_accuracy, val_accuracy):
     torch.save({
         "format_version": 2,
         "question_aware": True,
+        "graph_mode": model.graph.mode,
+        "graph_top_k": model.graph.top_k,
+        "graph_geometry": model.graph.geometry,
         "epoch": epoch,
         "training_accuracy": train_accuracy,
         "validation_accuracy": val_accuracy,
@@ -150,9 +174,43 @@ def save_checkpoint(model, dataset, epoch, train_accuracy, val_accuracy):
     print(f"Saved checkpoint: {CHECKPOINT_PATH}")
 
 
-def sample_losses(model, raw_objects, q_emb, label):
+def contact_targets(boxes: torch.Tensor, gap: float = CONTACT_GAP) -> torch.Tensor:
+    """[N, N] 1 where two boxes overlap or nearly touch (a physical-interaction prior,
+    e.g. person-bicycle, hand-umbrella), 0 otherwise.  Diagonal is 0."""
+    x0, y0, x1, y1 = boxes.unbind(-1)
+    gap_x = torch.clamp(torch.maximum(x0[:, None], x0[None, :]) - torch.minimum(x1[:, None], x1[None, :]), min=0)
+    gap_y = torch.clamp(torch.maximum(y0[:, None], y0[None, :]) - torch.minimum(y1[:, None], y1[None, :]), min=0)
+    touching = ((gap_x <= gap) & (gap_y <= gap)).float()
+    touching.fill_diagonal_(0.0)
+    return touching
+
+
+def edge_supervision_loss(edge_probs: torch.Tensor, boxes: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    """BCE between the (direction-free) edge probability max(p_ij, p_ji) and box contact.
+    The direction is left to the model (and the acyclicity term)."""
+    n = edge_probs.shape[0]
+    if n < 2:
+        zero = edge_probs.new_tensor(0.0)
+        return zero, {"p_contact": zero, "p_far": zero}
+    target = contact_targets(boxes.to(edge_probs.device))
+    sym = torch.maximum(edge_probs, edge_probs.T).clamp(1e-6, 1 - 1e-6)
+    off = ~torch.eye(n, dtype=torch.bool, device=edge_probs.device)
+    positives = target[off].sum()
+    weight = torch.where(target[off] > 0, (off.sum() - positives).clamp(min=1) / positives.clamp(min=1),
+                         torch.ones_like(target[off]))   # balance contact / non-contact pairs
+    loss = F.binary_cross_entropy(sym[off], target[off], weight=weight)
+    contact = target[off] > 0
+    stats = {
+        "p_contact": sym[off][contact].mean().detach() if contact.any() else None,
+        "p_far": sym[off][~contact].mean().detach() if (~contact).any() else None,
+    }
+    return loss, stats
+
+
+def sample_losses(model, raw_objects, q_emb, label, boxes, supervise_edges=True):
     """Factual forward pass + SCM regularisers + counterfactual terms for one sample."""
-    out = model.forward_features(raw_objects.unsqueeze(0).to(DEVICE), q_emb.unsqueeze(0).to(DEVICE))
+    out = model.forward_features(raw_objects.unsqueeze(0).to(DEVICE), q_emb.unsqueeze(0).to(DEVICE),
+                                 boxes.unsqueeze(0).to(DEVICE))
 
     logits = torch.clamp(out["logits"], -30, 30)
     loss_task = F.cross_entropy(logits, label.view(1))
@@ -187,15 +245,27 @@ def sample_losses(model, raw_objects, q_emb, label):
     ) * (1.0 + strength)
     loss_shift = torch.mean(torch.abs(F.softmax(cf_logits, dim=-1) - F.softmax(logits.detach(), dim=-1)))
 
+    if supervise_edges:
+        loss_edge, edge_stats = edge_supervision_loss(out["edge_probs"][0], boxes)
+    else:
+        loss_edge, edge_stats = logits.new_tensor(0.0), {"p_contact": None, "p_far": None}
+
     loss = (
         loss_task
+        + LAMBDA_EDGE * loss_edge
         + LAMBDA_SPARSE * loss_sparse
         + LAMBDA_ACYCLIC * loss_acyclic
         + LAMBDA_ENTROPY * loss_entropy
         + LAMBDA_CF * loss_cf
         + LAMBDA_SHIFT * loss_shift
     )
-    parts = {"task": loss_task, "cf": loss_cf, "shift": loss_shift, "acyclic": loss_acyclic}
+    parts = {"task": loss_task, "cf": loss_cf, "shift": loss_shift, "acyclic": loss_acyclic,
+             "edge": loss_edge, **edge_stats,
+             # graph health: total parent weight per object and the mean edge probability
+             "graph_mass": A.sum(dim=-1).mean().detach(),
+             "edge_prob": out["edge_probs"][0][~torch.eye(A.shape[0], dtype=torch.bool,
+                                                          device=A.device)].mean().detach()
+             if A.shape[0] > 1 else torch.tensor(0.0)}
     return loss, logits, parts
 
 
@@ -206,14 +276,21 @@ def evaluate(model, dataset, indices, cache):
     model.eval()
     factual = counterfactual = total = 0
     shifts = []
+    p_contact, p_far = [], []
     for index in indices:
         image_path, question, label = dataset[index]
         try:
-            raw = cache.image(image_path)
+            raw, boxes = cache.image(image_path)
             if raw.shape[0] == 0:
                 continue
             out = model.forward_features(raw.unsqueeze(0).to(DEVICE),
-                                         cache.question(question).unsqueeze(0).to(DEVICE))
+                                         cache.question(question).unsqueeze(0).to(DEVICE),
+                                         boxes.unsqueeze(0).to(DEVICE))
+            _, edge_stats = edge_supervision_loss(out["edge_probs"][0], boxes)
+            if edge_stats["p_contact"] is not None:
+                p_contact.append(float(edge_stats["p_contact"]))
+            if edge_stats["p_far"] is not None:
+                p_far.append(float(edge_stats["p_far"]))
         except Exception as error:  # unreadable image etc.
             print(f"EVAL SKIP {image_path}: {error}")
             continue
@@ -231,7 +308,12 @@ def evaluate(model, dataset, indices, cache):
         total += 1
     model.train()
     total = max(total, 1)
-    return 100.0 * factual / total, 100.0 * counterfactual / total, sum(shifts) / max(len(shifts), 1)
+    relation = {
+        "val_edge_prob_contact": sum(p_contact) / max(len(p_contact), 1),
+        "val_edge_prob_far": sum(p_far) / max(len(p_far), 1),
+    }
+    return (100.0 * factual / total, 100.0 * counterfactual / total, sum(shifts) / max(len(shifts), 1),
+            relation)
 
 
 # =====================================================
@@ -239,7 +321,7 @@ def evaluate(model, dataset, indices, cache):
 # =====================================================
 
 def main() -> None:
-    global LAMBDA_CF
+    global LAMBDA_CF, LAMBDA_EDGE
     parser = argparse.ArgumentParser(description="Train SCM-VLM")
     parser.add_argument("--samples", type=int, default=TRAIN_SAMPLES)
     parser.add_argument("--epochs", type=int, default=EPOCHS)
@@ -248,6 +330,11 @@ def main() -> None:
     parser.add_argument("--max-answers", type=int, default=MAX_ANSWERS)
     parser.add_argument("--val-fraction", type=float, default=VAL_FRACTION)
     parser.add_argument("--no-cf", action="store_true", help="ablation: disable the counterfactual loss")
+    parser.add_argument("--no-edge-supervision", action="store_true",
+                        help="ablation: disable the box-contact relation supervision")
+    parser.add_argument("--graph-mode", choices=["soft", "legacy"], default="soft",
+                        help="soft (default): weighted top-k edges, no hard threshold. "
+                             "legacy: the original hard-threshold graph (collapsed in practice)")
     args = parser.parse_args()
 
     random.seed(SEED)
@@ -256,6 +343,8 @@ def main() -> None:
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     if args.no_cf:
         LAMBDA_CF = 0.0
+    if args.no_edge_supervision:
+        LAMBDA_EDGE = 0.0
 
     print(f"\nUSING DEVICE: {DEVICE}")
 
@@ -264,7 +353,9 @@ def main() -> None:
     print(f"Answer vocabulary: {len(dataset.answer2idx)} | train questions: {len(train_idx)} "
           f"| validation questions: {len(val_idx)}")
 
-    model = SCMVLM(num_classes=len(dataset.answer2idx), question_aware=True).to(DEVICE)
+    model = SCMVLM(num_classes=len(dataset.answer2idx), question_aware=True,
+                   graph_mode=args.graph_mode, graph_top_k=GRAPH_TOP_K,
+                   graph_geometry=args.graph_mode == "soft").to(DEVICE)
     cache = FeatureCache(model, CACHE_DIR)
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=1e-4
@@ -283,16 +374,18 @@ def main() -> None:
         order = list(train_idx)
         random.shuffle(order)
         total_loss, correct, seen = 0.0, 0, 0
+        graph_mass, edge_prob = 0.0, 0.0
         optimizer.zero_grad()
         in_batch = 0
 
         for step, index in enumerate(order, start=1):
             image_path, question, label = dataset[index]
             try:
-                raw = cache.image(image_path)
+                raw, boxes = cache.image(image_path)
                 if raw.shape[0] == 0:
                     continue
-                loss, logits, parts = sample_losses(model, raw, cache.question(question), label.to(DEVICE))
+                loss, logits, parts = sample_losses(model, raw, cache.question(question), label.to(DEVICE),
+                                                    boxes, supervise_edges=LAMBDA_EDGE > 0)
             except Exception as error:
                 print(f"TRAIN SKIP {image_path}: {error}")
                 continue
@@ -303,6 +396,8 @@ def main() -> None:
             in_batch += 1
             correct += int(logits.argmax(-1).item() == label.item())
             total_loss += loss.item()
+            graph_mass += float(parts["graph_mass"])
+            edge_prob += float(parts["edge_prob"])
             seen += 1
 
             if in_batch == args.batch_size or step == len(order):
@@ -314,14 +409,18 @@ def main() -> None:
             if seen % 500 == 0:
                 print(f"[TRAIN] epoch={epoch + 1} sample={seen} loss={loss.item():.4f} "
                       f"task={parts['task'].item():.4f} cf={parts['cf'].item():.4f} "
-                      f"acyc={parts['acyclic'].item():.4f} running_acc={correct / seen:.4f}")
+                      f"acyc={parts['acyclic'].item():.4f} running_acc={correct / seen:.4f} "
+                      f"graph_mass={graph_mass / seen:.3f}")
 
         scheduler.step()
         train_acc = correct / max(seen, 1)
-        val_factual, val_cf, val_shift = evaluate(model, dataset, val_idx, cache)
+        val_factual, val_cf, val_shift, relation = evaluate(model, dataset, val_idx, cache)
+        mean_mass = graph_mass / max(seen, 1)
+        mean_prob = edge_prob / max(seen, 1)
         history.append({"epoch": epoch + 1, "loss": total_loss, "train_accuracy": train_acc,
                         "val_factual_accuracy": val_factual, "val_counterfactual_accuracy": val_cf,
-                        "val_intervention_shift": val_shift})
+                        "val_intervention_shift": val_shift, "graph_mass": mean_mass,
+                        "mean_edge_prob": mean_prob, **relation})
 
         print("\n========================")
         print(f"EPOCH {epoch + 1}")
@@ -330,6 +429,11 @@ def main() -> None:
         print(f"Train accuracy           : {train_acc:.4f}")
         print(f"Val factual accuracy     : {val_factual:.2f}%")
         print(f"Val counterfactual acc.  : {val_cf:.2f}%")
+        print(f"Graph: parent weight/obj : {mean_mass:.3f}   mean edge prob: {mean_prob:.3f}")
+        print(f"Relations (val)          : edge prob for touching objects "
+              f"{relation['val_edge_prob_contact']:.3f} vs distant {relation['val_edge_prob_far']:.3f}")
+        if mean_mass < 0.05:
+            print("WARNING: the relation graph is collapsing (almost no edge weight left).")
 
         pd.DataFrame(history).to_csv(os.path.join(RESULTS_DIR, "training_history.csv"), index=False)
         if val_factual > best_val:
